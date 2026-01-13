@@ -1,0 +1,21 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[[source]]
+url = "https://download.pytorch.org/whl/cu121"
+verify_ssl = true
+name = "downloadpytorch"
+
+[packages]
+numpy = "*"
+scikit-learn = "*"
+matplotlib = "*"
+torch = {version = "*", index = "downloadpytorch"}
+
+[dev-packages]
+ipykernel = "*"
+
+[requires]
+python_version = "3.12"

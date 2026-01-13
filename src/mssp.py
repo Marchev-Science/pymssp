@@ -1,0 +1,353 @@
+from src.data import DataManager
+from src.ols import PairwiseLinearRegression, ensure_x, ensure_y
+from src.graph import ModelGraph
+from src.plot import MSSPPlot
+import torch
+import time
+
+class MSSP(MSSPPlot):
+    def __init__(
+        self, 
+        n_best=100, 
+        epochs=10, 
+        loss_fn="mape", 
+        early_stopping=True, 
+        patience=5, 
+        random_seed=None,
+        allow_diversity=True,
+        diversity_ratio=0.75,
+        dropna=True,
+        pow_cross=True,
+        cv=None
+    ):
+        if not isinstance(n_best, int) or n_best <= 0:
+            raise ValueError(f"N best must be a positive integer, received {n_best} of type {type(n_best)}")
+        self.n_best = n_best
+        
+        if cv:
+            if not isinstance(cv, int):
+                raise Exception("CV should either be None or an int")
+
+        if random_seed is not None:
+            torch.manual_seed(random_seed)
+            torch.cuda.manual_seed(random_seed)
+
+        self.loss_fn = loss_fn
+        self.epochs = epochs
+        self.early_stopping = early_stopping
+        self.patience = patience
+        self.diversity_ratio = diversity_ratio
+        self.dropna = dropna
+        self.pow_cross = pow_cross
+        self.built = False
+        self.cv = cv
+
+    def _init_objects(self):
+        self.data_manager = DataManager()
+        self.ols = PairwiseLinearRegression(metrics=self.loss_fn)
+        self.history = []
+        self.built = False
+        self.model = []
+
+
+    def register(self, data):
+        self.history.append(data)
+
+
+    def _normalize(self, X, X_valid=None):
+        if X_valid is None:
+            return (X - X.min(dim=0)[0]) / (X.max(dim=0)[0] - X.min(dim=0)[0] + 1e-6) + 1e-6, None
+        max = torch.max(X.max(dim=0)[0], X_valid.max(dim=0)[0])
+        min = torch.min(X.min(dim=0)[0], X_valid.min(dim=0)[0])
+        X = (X - min) / (max - min + 1e-6) + 1e-6
+        X_valid = (X_valid - min) / (max - min + 1e-6) + 1e-6
+        return X, X_valid
+
+
+    def _on_epoch_end(self, mask, ep, pow_cross):
+        msg = {
+            'mask': mask.clone().cpu(),
+            'epoch': ep,
+            'coef': self.ols.coef_[mask, :].clone().cpu(),
+            'intercept': self.ols.intercept_[mask].clone().cpu(),
+            'i': self.ols.i[mask].clone().cpu(),
+            'j': self.ols.j[mask].clone().cpu(),
+            'type': 'pow_cross_selection' if pow_cross else 'lin_cross_selection',
+        }
+
+        self.register(msg)
+
+
+    def _fit(self, X, y, X_valid, y_valid, ep, pow_cross=False, is_cv_fold=False, mask=None):
+        if pow_cross:
+            X = torch.log(X)
+            if X_valid is not None:
+                X_valid = torch.log(X_valid)
+            if is_cv_fold:
+                y = torch.log(y)
+                y_valid = torch.log(y_valid)
+        
+        self.ols.fit(X, y)
+        
+        if X_valid is not None: 
+            scores = self.ols.evaluate(X_valid, y_valid, pow_cross=pow_cross)
+        else:
+            scores = self.ols.evaluate(X, y, pow_cross=pow_cross)
+
+        if mask is None:
+            mask = self._get_index_mask(scores[self.loss_fn])
+
+        '''
+        Mask is an integer mask. After prediction, only get the relevant columns.
+        '''
+        X = self.ols.predict(X)
+        X = X[:, mask]
+
+        if X_valid is not None:
+            X_valid = self.ols.predict(X_valid)
+            X_valid = X_valid[:, mask]
+
+        if pow_cross:
+            X = torch.exp(X)
+            if X_valid is not None:
+                X_valid = torch.exp(X_valid)
+        
+        scores = scores[self.loss_fn]
+
+
+
+        '''
+        If is a cv fold, all the scores are required + no _on_epoch_end
+        '''
+        if not is_cv_fold:
+            self._on_epoch_end(mask, ep, pow_cross)
+            scores = scores[mask]
+
+        return X, X_valid, scores
+
+
+    def _get_best_solutions(self, X, X_valid, scores, epoch):
+        mask = self._get_index_mask(scores.clone().cpu())
+        self.register({
+            'mask': mask, 
+            'epoch': epoch,
+            'type': 'best_selection',
+        })
+        if X_valid is not None:
+            X_valid = X_valid[:, mask]
+        return X[:, mask], X_valid
+
+
+    def _get_index_mask(self, scores):
+        '''
+        Get ranks of scores low to high and sort scores.
+        '''
+        indexes = torch.argsort(scores)
+        scores = scores[indexes]
+
+        '''
+        Check whether there are bad scores (log can introduse).
+        This is important as if not excluded, the random mask might choose them.
+        '''
+        bad_mask = ~torch.isfinite(scores)
+        if bad_mask.any():
+            i = bad_mask.nonzero()[0, 0]
+            indexes = indexes[:i]
+
+        '''
+        Mask the n_best for next generation. Introduce some randomness.
+        Mask is an integer mask indicating the index of the element (it's not boolean)
+        '''
+        mask = indexes[:int(self.n_best * (1 - self.diversity_ratio))]
+        indexes = indexes[int(self.n_best * (1 - self.diversity_ratio)):]
+        if indexes.shape[0] != 0:
+            mask_rand = indexes[torch.randperm(len(indexes))[:int(self.n_best * self.diversity_ratio)]]
+            mask = torch.cat([mask, mask_rand])
+        return mask
+
+
+    def compute_scores(self, X, X_valid, y, y_valid, y_cross, y_cross_valid, ep, is_cv_fold=False, mask=(None, None)):
+        '''
+        Fitting all pairwise and getting the n_best + a portion of random candidates for each method (lin, pow).
+        '''
+        X_lin, X_lin_valid, scores_lin = self._fit(X, y, X_valid=X_valid, y_valid=y_valid, ep=ep, is_cv_fold=is_cv_fold, mask=mask[0])
+        if self.pow_cross:
+            X_pow, X_pow_valid, scores_pow = self._fit(X, y_cross, X_valid=X_valid, y_valid=y_cross_valid, ep=ep, pow_cross=True, is_cv_fold=is_cv_fold, mask=mask[1])
+
+
+        '''
+        Getting n_best + a portion of random candidates from the overall population.
+        '''
+        scores, X, X_valid = scores_lin, X_lin, X_lin_valid
+        if self.pow_cross:
+            scores = torch.cat([scores_lin, scores_pow])
+
+            if is_cv_fold: #used inside cv
+                return scores
+
+            X = torch.cat([X_lin, X_pow], dim=1)
+            if X_valid is not None:
+                X_valid = torch.cat([X_lin_valid, X_pow_valid], dim=1)
+        
+        return scores, X, X_valid
+    
+    
+    def _cv_folds(self, len_x):
+        indexes = torch.randperm(len_x)
+        folds = torch.linspace(0, len_x, steps=self.cv + 1, dtype=int)
+        for i, start in enumerate(folds[:-1], 1):
+            i_te = indexes[start: folds[i]]
+            mask = torch.ones(len_x, dtype=torch.bool)
+            mask[i_te] = False
+            i_tr = torch.nonzero(mask).flatten()
+            yield i_tr, i_te
+
+
+    def _get_cv_scores(self, X, y, y_cross, ep):
+        scores = []
+        for i_tr, i_va in self._cv_folds(X.shape[0]):
+            score = self.compute_scores(X[i_tr], X[i_va], y[i_tr], y[i_va], y_cross[i_tr], y_cross[i_va], ep, is_cv_fold=True)
+            scores.append(score)
+        return torch.stack(scores, dim=0).mean(dim=0)
+
+
+    def _get_cv_masks(self, scores):
+        if self.pow_cross:
+            s_lin, s_pow = scores[:scores.shape[0] //2], scores[scores.shape[0] //2:]
+            mask_lin = self._get_index_mask(s_lin.clone().cpu())
+            mask_pow = self._get_index_mask(s_pow.clone().cpu())
+            return mask_lin, mask_pow, torch.cat([s_lin[mask_lin], s_pow[mask_pow]])
+        mask_lin = self._get_index_mask(scores.clone().cpu())
+        return mask_lin, None, scores[mask_lin]
+
+
+    @ensure_y
+    @ensure_x
+    def fit(self, X, y, X_valid=None, y_valid=None):
+        '''
+        Init inside fit so a subsequent call to the method resets the state and history is correct.
+        '''
+        self._init_objects()
+
+        X, params = self.data_manager.fit(X, y)
+        
+        self.register({
+            'type': 'primitives',
+            'epoch': -1,
+            'params': params
+        })
+
+        X_valid, y_valid = self._validate_X_y_valid(X_valid, y_valid)
+        
+        y_cross, y_cross_valid = None, None
+        if self.pow_cross:
+            if y.min() <= 0:
+                # TODO normalize y in data manager aswell, when predicting apply inverse transform to return in original dimension
+                raise Exception("Negative values in the target, handle appropriate for pow cross method.")
+            y_cross = torch.log(y)
+            y_cross_valid = torch.log(y_valid) if y_valid is not None else y_cross
+
+
+        best_loss, patience_counter = float('inf'), 0
+        for ep in range(self.epochs):
+            st = time.time()
+
+            if self.cv:
+                scores = self._get_cv_scores(X, y, y_cross, ep)
+                mask_lin, mask_pow, scores = self._get_cv_masks(scores)
+                _, X, X_valid = self.compute_scores(X, X_valid, y, y_valid, y_cross, y_cross_valid, ep, mask=(mask_lin, mask_pow))
+            else:
+                scores, X, X_valid = self.compute_scores(X, X_valid, y, y_valid, y_cross, y_cross_valid, ep)
+
+            X, X_valid = self._get_best_solutions(X, X_valid, scores, ep)
+
+
+            '''
+            Early stopping logic.
+            '''
+            scores = scores[~torch.isnan(scores)] # or normalize?
+            loss_epoch = scores.min()
+
+            print(f'loss ({self.loss_fn}): {loss_epoch.item():.4f}', "epoch:", ep, f", time: {time.time() - st:.2f}s")
+
+            if not self.early_stopping:
+                best_loss = min(best_loss, loss_epoch)
+                continue
+
+            if loss_epoch < best_loss:
+                best_loss = loss_epoch
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= self.patience:
+                    break
+
+        print(f"Best loss: {best_loss} after training for {ep} epochs")
+
+
+    def _validate_X_y_valid(self, X_valid, y_valid):
+        if X_valid is None and y_valid is None:
+            return None, None
+        
+        if self.cv:
+            raise Exception("When validation data is provided, cv should be set to False")
+
+        if not all(val is not None for val in [X_valid, y_valid]):
+            raise ValueError("X_valid and y_valid must be provided together")
+        
+        if not isinstance(X_valid, torch.Tensor):
+            X_valid = torch.as_tensor(X_valid, dtype=torch.float)
+
+        if not isinstance(y_valid, torch.Tensor):
+            y_valid = torch.as_tensor(y_valid, dtype=torch.float)
+
+        if X_valid.ndim != 2:
+            raise ValueError(f"X_valid must be a 2D tensor, received {X_valid.ndim}D")
+
+        X_valid = self.data_manager.transform(X_valid)
+
+        return X_valid, y_valid
+
+
+    @ensure_x
+    def predict(self, X, top_k=1, clip=None):
+        self._build_model(top_k)
+        if clip is None:
+            clip = self.pow_cross
+        X = self.data_manager.transform(X, apply_primitives=False, clip=clip)
+
+        preds = []
+        for m in self.model[:top_k]:
+            p = m.predict(X)
+            preds.append(p.reshape(-1))
+
+        return torch.stack(preds, dim=0).mean(dim=0)
+
+
+    @ensure_x
+    def evaluate(self, X, y, top_k=1, clip=None):
+        y_pred = self.predict(X, top_k=top_k, clip=clip)
+        mse = ((y_pred - y)**2)
+        return mse.mean(), mse.std() / mse.mean()
+
+
+    def _build_model(self, top_k):
+        '''
+        Validations
+        '''
+        if not isinstance(top_k, int):
+            raise TypeError(f"top_k should be int, got {type(top_k)}")
+
+        if top_k < 0 or top_k > self.n_best:
+            raise ValueError(f"top_k should be an int between 1 and n_best ({self.n_best})")
+
+        '''
+        Required number already built, no need to rebuild models.
+        '''
+        if (lm := len(self.model)) == top_k:
+            return
+        
+        '''
+        If there are already multiple models built, only build required to get up to top_k, no need to rebuild models.
+        '''
+        self.model.extend([ModelGraph(self.history, i) for i in range(lm, top_k)])
