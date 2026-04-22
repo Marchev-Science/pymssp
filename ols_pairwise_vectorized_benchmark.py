@@ -64,17 +64,16 @@ def incremental_gram_host_to_cuda(
 
 
 def fit_ols_pairwise(X_ij: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    Z = torch.cat(
+    X = torch.cat(
         [
             torch.ones((X_ij.shape[0], 1), dtype=X_ij.dtype, device=X_ij.device),
             X_ij,
         ],
         dim=1,
     )
-    XtX = Z.T @ Z
-    Xty = Z.T @ y
+    XtX = X.T @ X
+    Xty = X.T @ y
     return torch.linalg.solve(XtX, Xty)
-
 
 def fit_all_pairs_vectorized(
     X: torch.Tensor,
@@ -129,13 +128,11 @@ def fit_all_pairs_vectorized(
 
 def all_pairs_explicit_columns(X: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     p = X.shape[1]
-    c = p * (p - 1) // 2
+    pairs = list(combinations(range(p), 2))
+    c = len(pairs)
     out = torch.empty((c, 3), dtype=X.dtype, device=X.device)
-    k = 0
-    for i in range(p):
-        for j in range(i + 1, p):
-            out[k] = fit_ols_pairwise(X[:, [i, j]], y)
-            k += 1
+    for k, (i, j) in enumerate(pairs):
+        out[k] = fit_ols_pairwise(X[:, [i, j]], y)
     return out
 
 
