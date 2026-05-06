@@ -1,4 +1,4 @@
-()[pyMSSP.png]
+[pyMSSP.png]
 
 
 ### Environment Installation
