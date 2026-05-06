@@ -1,4 +1,4 @@
-![image](pyMSSP.png)
+<img src="pyMSSP.png" alt="pyMSSP" width="100"/>
 
 
 ### Environment Installation
